@@ -1,0 +1,531 @@
+---
+title: "Scraping MeteoIT"
+author: "Beniamino Sartini"
+date: "15/6/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(stringr)   # stringhe
+library(dplyr)     # dataset
+library(purrr)     # loops 
+library(xml2)      # scraping 
+library(lubridate) # datse (functions year(), month())
+library(ggplot2)
+library(ggthemes)  # temi per grafici
+
+# FUNZIONI Utils 
+# rende la prima lettera di una parola maiuscola (per controllo imput)
+  FirstToupper <- function(word){
+    
+    word = str_split(word, "")
+    
+    word[[1]][1] = toupper(word[[1]][1])
+    
+    word = paste0(word[[1]], collapse = "")
+    
+    return(word)
+    
+  }  
+
+```
+
+
+# Introduzione al problema 
+
+Dopo aver effettuato numerose ricerche su internet abbiamo notato una carenza di fonti di informazione riguardanti i dati metereologici in italia, che siano: 
+1. Facilmente accessibili e con un numero sufficiente di informazioni temporali. 
+2. Consistenti tra dati di varie zone. 
+3. Ordinati in forma tabellare per effettuare delle analisi.
+
+Una delle fonti piu complete individuate è stata quella dell'[aereonautica militare] (https://clima.meteoam.it/RicercaDati.php), tuttavia i dati non sono ad accesso libero, ma a **pagamento*. Un altro sito governativo dove è possibile accedere a numerosi dataset è quello degli [open data della pubblica amministrazione](https://www.dati.gov.it/). Tuttavia anche in questo caso ci siamo trovati di fronte a vari problemi di diversita e inconsistenza tra i dati che vengono forniti da diverse pubbliche amministrazioni regionali in formati non standardizzati. Inoltre non sono presenti serie storiche sufficientemente lunghe per tutte le regioni, per alcune (come ad esempio la sicilia), sono presenti numerosi dati, tuttavia non sono molto estesi dal punto di vista della serie storica. 
+
+
+# La soluzione: scaping sull'Archivio Storico del Meteo.it
+
+L'unica fonte che ci permette di ottenere l'accessio a una vastissia gamma di informazioni è il [ilmeteo.it](https://ilmeteo.it), sezione archivio storico. In primo luogo notiamo che l'url presenta una certa regolarità: **ilmeteo.it/portale/archivio-meteo/**, *{citta}/{anno}/{mese}*. Possiamo quindi procedere ad individuare un framework consistente e robusto, per farlo procederemo con uno schema top-down per capire la struttura del sito, per poi implementare un framework bottom-up.
+
+\newpage
+
+## Le informazioni disponibili 
+
+Abbiamo notato che esistono due livelli di informazione disponibili:
+
+1. Il primo livello è accessibile tramite un url del tipo *{citta}/{anno}/{mese}*, tuttavia questo livello, facile da raggiungere e importare contiene solo una parte delle informazioni disponibili. 
+
+2. Un secondo livello del tipo *{citta}/{anno}/{mese}/{giorno}*, contine molte piu informazioni tra cui: 
+
+- temperatura (minima, massima e media)
+- punto di rugiada (dew_point)
+- precipitazioni
+- umidità (minima, massima e media)
+- visibilità
+- velocita del vento (massima e media) e raffiche
+- pressione (media e a livello del mare)
+- fenomeni atmosferici del giorno (etichette del meteo.it)
+- condizioni meteo del giorno (etichette del meteo.it)
+
+```{r, Struttura Html meteoIt}
+
+# url di esempio 
+url = "https://www.ilmeteo.it/portale/archivio-meteo/Genova/2020/Febbraio"
+
+# importazione html 
+html = xml2::read_html(url)
+
+# le informazioni storiche si trovano nella tabella 4 
+table = xml2::xml_find_all(html, "//table")[4]
+
+# ricerco tutti i tr contenuti nella 4 tabella (i tr rappresentano la singola riga della tabella)
+all_tr = xml2::xml_find_all(table, "./tr")
+
+all_tr[1:5]
+
+```
+
+Dopo aver osservato la struttura html generale abbiamo pensato di costruire il framework nel seguente modo: 
+
+#### 0) Livello Zero
+
+Funzione **tr_to_row**, è la funzione di base che prende in input un singolo *tr* dalla lista *all_tr* e restituisce una riga di una tabella ordinata. Abbiamo optato per questa divisione poiche in questa maniera strutturiamo a priori il formato della tabella che vogliamo avere in output, siamo in grado di controllare ed evitare errori qualora un elemento non venga trovato e in generale rendiamo la procedura facilemente modificabile qualora avvenga una modifica nei codici sorgenti. 
+
+\newpage
+
+```{r, tr_to_row function}
+# FUNCTION: tr_to_row 
+tr_to_row <- function(tr){
+  
+  null_df = dplyr::tibble(
+    date = NA_character_,  # data in formato %YYYY/%MM/%DD
+    city = NA_character_,  # nome citta
+    n.day = NA_character_, # numero giorno del mese 
+    month = NA_character_, # numero del mese 
+    year = NA_character_,  # anno 
+    
+    mean_temp = NA_integer_,   # temperatura media 
+    min_temp = NA_integer_,    # temperatura minima 
+    max_temp = NA_integer_,    # temperatura massima 
+    
+    dew_point = NA_character_, # punto di rugiada
+    precip = NA_character_,    # precipitazioni 
+    mean_humid = NA_character_,# umidita media 
+    min_humid = NA_character_, # umidita minima 
+    max_humid = NA_character_, # umidita massima 
+    visibility = NA_character_,# visibilita
+    mean_wind = NA_character_, # velocita vento media 
+    max_wind = NA_character_,  # velocita vento massima 
+    burst = NA_character_,     # raffiche di vento 
+    mean_pressure = NA_character_,     # pressione media 
+    sealevel_pressure = NA_character_, # pressione media sul livello del mare
+    
+    rain = NA_character_,              # pioggia 
+    phenomena = NA_character_,         # fenomeni metereologici
+    weather_condition = NA_character_, # condizioni meteo 
+    url_info = NA_character_           # url infomazioni giornaliere 
+  ) 
+  
+  all_td = xml2::xml_find_all(tr, "./td")
+  
+  n.day = xml2::xml_text(all_td[1])
+  mean_temp = xml2::xml_text(all_td[2])
+  min_temp = xml2::xml_text(all_td[3])
+  max_temp = xml2::xml_text(all_td[4])
+  precip = xml2::xml_text(all_td[5])
+  max_vento = xml2::xml_text(all_td[7])
+  url_info = xml2::xml_attr(xml2::xml_find_all(all_td[10], "./a"), "href")
+  
+  null_df$n.day = ifelse(is.null(n.day), NA_character_, n.day)
+  null_df$mean_temp = ifelse(is.null(mean_temp), NA_character_, mean_temp)
+  null_df$min_temp = ifelse(is.null(min_temp), NA_character_, min_temp)
+  null_df$max_temp = ifelse(is.null(max_temp), NA_character_, max_temp)
+  null_df$precip = ifelse(is.null(precip), NA_character_, precip)
+  null_df$max_wind = ifelse(is.null(max_vento), NA_character_, max_vento)
+  null_df$url_info = ifelse(is.null(url_info), NA_character_, paste0("https://www.ilmeteo.it/portale/", url_info))
+  
+  return(null_df)
+}
+```
+
+\newpage
+
+### 1) Livello Base
+Funzione **Meteo_city_month_year**, è una funzione che prende in input il nome di una citta, il mese da importare e l'anno e otteniamo in output una singola tabella per il mese di riferimento.
+
+
+```{r, Meteo_city_month_year}
+# FUNCTION: Meteo_city_month_year 
+Meteo_city_month_year <- function(city = "", month = "", imp.year = "", verbose = TRUE){
+  
+  # creazione URL
+  base_url = "https://www.ilmeteo.it/portale/archivio-meteo"
+  
+  # match argomento anni
+  anni_validi = seq(1973, lubridate::year(Sys.Date()), 1)
+  imp.year = match.arg(imp.year, anni_validi)
+  
+  # la citta deve essere scritta sempre con la lettera maiuscola
+  # le citta con un nome composto vengono separate dal +: es Ascoli+Piceno
+  
+  city = stringr::str_split(city, " ")[[1]]     # separo le parole (se sono piu di una)
+  city = purrr::map_chr(city, FirstToupper)   # trasformo tutte le lettere in maiuscole 
+  city_name = paste0(city, collapse = " ")
+  city = paste0(city, collapse = "+")  # ricreo la stringa 
+  
+  # Mesi 
+  mesi_validi = c(Gennaio = 1, Febbraio = 2, Marzo = 3, 
+                  Aprile = 4, Maggio = 5, Giugno = 6, Luglio = 7, 
+                  Agosto = 8, Settembre = 9, Ottobre = 10, Novembre = 11, Dicembre = 12)
+  month_index = match.arg(month, mesi_validi)
+  month = names(month_index)
+  
+  # creazione url per l'importazione 
+  url = paste0(base_url, "/", city, "/", imp.year, "/", month )
+  
+  # lettura html 
+  html = xml2::read_html(url) 
+  
+  # tabella con informazioni di interesse n4
+  table = xml2::xml_find_all(html, "//table")[4]
+  
+  # separo tutte le righe per avere un importazione controllata (ma piu lunga) 
+  all_tr = xml2::xml_find_all(table, "./tr")
+  
+  df_importazione = purrr::map_df(all_tr[-1], tr_to_row)
+  df_importazione = dplyr::mutate(df_importazione, 
+                                  city = city_name, month = month_index, year = imp.year )
+  # creo la data 
+  df_importazione$date = as.Date(paste0(imp.year,"/", month_index, "/", df_importazione$n.day))
+  
+  if(verbose) message("Importazione: ", city_name, " (Anno: ", imp.year, ", Mese: ", month, ")")
+  
+  return(df_importazione)
+  
+}
+```
+
+\newpage
+
+### 2) Livello Intermedio
+
+Funzione  **Meteo_city_year**, è la funzione analoga alla precedente, con l'unica differenza che permette di importare tutti i mesi disponibili, la funzione è stata creata con lo scopo di evitare di mappare tutti i mesi dell'anno qualora inserissimo l'anno corrente. Infatti se inserissimo 2022 e mappassimo la funzione precedente per i mesi da 1 a 12 otterremo degli errori. 
+
+```{r, Meteo_city_year}
+# FUNCTION: Meteo_city_year 
+Meteo_city_year <- function(city = "", imp.year = "", verbose = TRUE){
+  
+  # match argomento anni
+  anni_validi = seq(1973, lubridate::year(Sys.Date()), 1)
+  
+  imp.year = as.character(match.arg(imp.year, anni_validi))
+  
+  if(imp.year == lubridate::year(Sys.Date())){
+    
+    max_month = lubridate::month(Sys.Date())
+    months = as.character(1:max_month)
+    
+  } else {
+    months = as.character(1:12)
+    
+  }
+  
+  purrr::map_df(months, ~Meteo_city_month_year(city = city, 
+                                               month = .x, 
+                                               imp.year = imp.year, 
+                                               verbose = verbose))
+}
+```
+
+\newpage
+
+
+## Funzione Finale: MeteoIT
+Funzione **MeteoIT**, prende in input una citta, un anno di inizio ed uno di fine e importa tutti i dati creando una tabella unica. 
+
+```{r, MeteoIT}
+# FUNCTION: MeteoIT 
+MeteoIT <- function(city = "", start_year = "2021", end_year = "2022", verbose = TRUE){
+  
+  seq_years = as.numeric(start_year):as.numeric(end_year)
+  seq_years = as.character(seq_years)
+  
+  
+  purrr::map_df(seq_years, ~Meteo_city_year(city, 
+                                            imp.year = .x, 
+                                            verbose = verbose))
+}
+```
+
+
+### Esempio di Utilizzo 
+
+```{r, Esempio 1}
+df = MeteoIT("Bologna", start_year = "2021", end_year = "2022", verbose = FALSE)
+df
+```
+
+\newpage
+
+## Aggiunta dei dati giornalieri
+
+Molte delle informazioni che abbiamo indicato all'inizio non sono presenti semplicemente nella pagina della sezione dell'archivio storico per un certo mese e anno di una città, ma sono riportati in una pagina a parte. Difatti per ogni riga della tabella importata precedentemente dovremmo importare un ulteriore pagina html. L'operazione risulta abbastanza lunga, tuttavia necessaria per ottenere una tabella strutturata. Di seguito riportiamo la funzione **AddDailyInfo** che prende in input il dataset *df* creato in precedenza e utilizza il link presente in ciascuna riga per completare le informazioni. 
+
+
+```{r, AddDailyInfo}
+
+# FUNCTION: AddDailyInfo 
+AddDailyInfo <- function(df, verbose = TRUE ){
+  
+  # inizializzo output 
+  df_output = NULL
+  
+  # funzione per importare le informazioni di un singolo url di una singola riga 
+  DailyInfo <- function(df_row){
+    
+    url = df_row$url_info[1]
+    
+    html = read_html(url)
+    
+    table = xml_find_all(html, ".//table")[4]
+    table = html_table(table)[[1]]
+    
+    
+    df_row$mean_temp = table[1,][[2]]
+    df_row$min_temp = table[2,][[2]]
+    df_row$max_temp = table[3,][[2]]
+    df_row$dew_point = table[4,][[2]]
+    df_row$mean_humid = table[5,][[2]]
+    df_row$min_humid = table[6,][[2]]
+    df_row$max_humid = table[7,][[2]]
+    df_row$visibility = table[8,][[2]]
+    df_row$mean_wind = table[9,][[2]]
+    df_row$max_wind = table[10,][[2]]
+    df_row$burst = table[11,][[2]]
+    df_row$mean_pressure = table[12,][[2]]
+    df_row$sealevel_pressure = table[13,][[2]]
+    df_row$rain = table[14,][[2]]
+    df_row$phenomena = table[15,][[2]]
+    df_row$weather_condition = table[16,][[2]]
+    
+    return(df_row)
+    
+  }
+  
+  n_iter <- nrow(df) # Number of iterations of the loop
+  
+  if(verbose) message("Tempo Stimato: ", round(n_iter), " Secondi")
+  
+  start_time = Sys.time()
+  
+  if(verbose){
+  # Initializes the progress bar
+  pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                       max = n_iter, # Maximum value of the progress bar
+                       style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                       width = 50,   # Progress bar width. Defaults to getOption("width")
+                       char = "=")   # Character used to create the bar
+  }
+  
+  
+  all_df_info = list()
+  safe_import = purrr::safely(DailyInfo)
+  
+  for(i in 1:n_iter) {
+    
+    result = safe_import(df[i,])$result
+    # controllo per eventuali pagine mancanti 
+    if(is.null(result)){
+      all_df_info[[i]] = df[i,]
+    } else {
+      all_df_info[[i]] = result 
+    }
+    
+     if(verbose){setTxtProgressBar(pb, i)} # settaggio progress bar 
+
+  }
+  
+  if(verbose){close(pb)} # chiusura connesione 
+
+  end_time = Sys.time()
+  
+  if(verbose) message("Tempo Impiegato: ", 
+                      round(end_time-start_time, 3), 
+                      " Minuti...")
+  
+  # dataset finale 
+  df_output = bind_rows(all_df_info)
+  return(df_output)
+
+}
+
+```
+
+\newpage
+
+### Esempio di Utilizzo 
+Per questione di praticità l'esempio importerà solo le prime 30 righe (circa 1 mese).
+
+```{r, Esempio 2}
+
+# AddDailyInfo(df, verbose = FALSE)
+
+```
+
+\newpage
+
+## Funzione per la Pulizia dei Dati
+
+```{r, CleanMeteoIT}
+CleanMeteoIT <- function(df){
+
+  # clean temperature data 
+  
+  df = suppressWarnings(mutate(df, 
+              
+    # clean temperature data           
+    mean_temp = str_remove_all(mean_temp, "°C"),
+    mean_temp = str_trim(mean_temp), 
+    mean_temp = as.numeric(mean_temp),
+    
+    min_temp = str_remove_all(min_temp, "°C"),
+    min_temp = str_trim(min_temp), 
+    min_temp = as.numeric(min_temp),
+    
+    
+    max_temp = str_remove_all(max_temp, "°C"),
+    max_temp = str_trim(max_temp), 
+    max_temp = as.numeric(max_temp),
+    
+    dew_point = str_remove_all(dew_point, "°C"),
+    dew_point = str_trim(dew_point), 
+    dew_point = as.numeric(dew_point),
+    
+    precip = ifelse(precip == "n/d" | precip == "-", NA_character_, precip),
+    burst = ifelse(burst == "n/d" | burst == "-", NA_character_, burst),
+    rain = ifelse(rain == "n/d" | rain == "-", NA_character_, rain),
+    sealevel_pressure = ifelse(sealevel_pressure == "n/d" | sealevel_pressure == "-", NA_character_, sealevel_pressure),
+    
+    # humidity
+    mean_humid = str_remove_all(mean_humid, "%"),
+    mean_humid = str_trim(mean_humid), 
+    mean_humid = as.numeric(mean_humid),
+    
+    min_humid = str_remove_all(min_humid, "%"),
+    min_humid = str_trim(min_humid), 
+    min_humid = as.numeric(min_humid),
+    
+    
+    max_humid = str_remove_all(max_humid, "%"),
+    max_humid = str_trim(max_humid), 
+    max_humid = as.numeric(max_humid),
+    
+    # visibility 
+    visibility = str_remove_all(visibility, "km"),
+    visibility = str_trim(visibility), 
+    visibility = as.numeric(visibility),
+    
+    
+    
+    # wind
+    mean_wind = str_remove_all(mean_wind, "km/h"),
+    mean_wind = str_trim(mean_wind), 
+    mean_wind = as.numeric(mean_wind),
+    
+    max_wind = str_remove_all(max_wind, "km/h"),
+    max_wind = str_trim(max_wind), 
+    max_wind = as.numeric(max_wind),
+    
+    
+    # pressure 
+    sealevel_pressure = str_remove_all(sealevel_pressure, "mb"),
+    sealevel_pressure = str_trim(sealevel_pressure), 
+    sealevel_pressure = as.numeric(sealevel_pressure)
+    
+  ))
+  
+  df
+  
+}
+```
+
+
+\newpage
+
+
+
+## Un'analisi delle informazioni
+
+Per dare un'idea delle informazioni presenti abbiamo importato due anni di osservazioni per il comune di bologna di cui di seguito riportiamo alcuni grafici per temperatura e soprattutto per il vento. 
+
+```{r, echo = FALSE}
+
+load("bolo2122.RData")
+
+bolo2122 = CleanMeteoIT(bolo2122)
+
+bolo2122 %>%
+  ggplot()+
+  geom_line(aes(date, mean_temp))+
+  geom_line(aes(date, min_temp), col = "lightblue") +
+  geom_line(aes(date, max_temp), col = "red") +
+  ggtitle("Temperatura (Bologna 2021-2022)", 
+          subtitle = "Minima(blu), Media(Nera), Massima(Rossa)")+
+  xlab("Data")+
+  ylab("Temperatura (°C)")+
+  ggthemes::theme_solarized()
+
+
+bolo2122 %>%
+  filter(!is.na(mean_wind)) %>%
+  ggplot()+
+  geom_boxplot(aes(phenomena, mean_wind))+
+  coord_flip()+
+  ggtitle("Velocita del Vento per Fenomeno (Bologna 2021-2022)", 
+          subtitle = "Media(Nera), Massima(Rossa)")+
+  xlab("Data")+
+  ylab("Velocità (km/h)")+
+  ggthemes::theme_solarized()
+
+
+bolo2122 %>%
+  ggplot()+
+  geom_line(aes(date, mean_wind))+
+  geom_line(aes(date, max_wind), col = "red") +
+  ggtitle("Velocita del Vento (Bologna 2021-2022)", 
+          subtitle = "Media(Nera), Massima(Rossa)")+
+  xlab("Data")+
+  ylab("Velocità (km/h)")+
+  ggthemes::theme_solarized()
+
+
+bolo2122 %>%
+  filter(!is.na(mean_wind)) %>%
+  ggplot()+
+  geom_boxplot(aes(weather_condition, mean_wind))+
+  coord_flip()+
+  ggtitle("Velocita del Vento per Condizioni Climatiche (Bologna 2021-2022)", 
+          subtitle = "Media(Nera), Massima(Rossa)")+
+  xlab("Data")+
+  ylab("Velocità (km/h)")+
+  ggthemes::theme_solarized()
+
+
+bolo2122 %>%
+  filter(!is.na(mean_wind)) %>%
+  ggplot()+
+  geom_boxplot(aes(phenomena, mean_wind))+
+  coord_flip()+
+  ggtitle("Velocita del Vento per Fenomeno (Bologna 2021-2022)", 
+          subtitle = "Media(Nera), Massima(Rossa)")+
+  xlab("Data")+
+  ylab("Velocità (km/h)")+
+  ggthemes::theme_solarized()
+
+```
+
+
+
+
+
+
